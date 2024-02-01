@@ -1,0 +1,16 @@
+{
+  "object": {
+    "pins": [
+      {
+        "package": "ggml",
+        "repositoryURL": "https://github.com/dotmain/ggml.git",
+        "state": {
+          "branch": "main_init",
+          "revision": "53558f9cb9731e57134ebc86275ddf1eecf18356",
+          "version": null
+        }
+      }
+    ]
+  },
+  "version": 1
+}
