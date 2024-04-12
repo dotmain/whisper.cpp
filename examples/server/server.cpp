@@ -22,13 +22,6 @@ using json = nlohmann::ordered_json;
 
 namespace {
 
-// Terminal color map. 10 colors grouped in ranges [0.0, 0.1, ..., 0.9]
-// Lowest is red, middle is yellow, highest is green.
-const std::vector<std::string> k_colors = {
-    "\033[38;5;196m", "\033[38;5;202m", "\033[38;5;208m", "\033[38;5;214m", "\033[38;5;220m",
-    "\033[38;5;226m", "\033[38;5;190m", "\033[38;5;154m", "\033[38;5;118m", "\033[38;5;82m",
-};
-
 // output formats
 const std::string json_format   = "json";
 const std::string text_format   = "text";
@@ -60,6 +53,7 @@ struct whisper_params {
     int32_t max_len       = 0;
     int32_t best_of       = 2;
     int32_t beam_size     = -1;
+    int32_t audio_ctx     = 0;
 
     float word_thold      =  0.01f;
     float entropy_thold   =  2.40f;
@@ -95,35 +89,7 @@ struct whisper_params {
     std::string openvino_encode_device = "CPU";
 };
 
-//  500 -> 00:05.000
-// 6000 -> 01:00.000
-std::string to_timestamp(int64_t t, bool comma = false) {
-    int64_t msec = t * 10;
-    int64_t hr = msec / (1000 * 60 * 60);
-    msec = msec - hr * (1000 * 60 * 60);
-    int64_t min = msec / (1000 * 60);
-    msec = msec - min * (1000 * 60);
-    int64_t sec = msec / 1000;
-    msec = msec - sec * 1000;
-
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d%s%03d", (int) hr, (int) min, (int) sec, comma ? "," : ".", (int) msec);
-
-    return std::string(buf);
-}
-
-int timestamp_to_sample(int64_t t, int n_samples) {
-    return std::max(0, std::min((int) n_samples - 1, (int) ((t*WHISPER_SAMPLE_RATE)/100)));
-}
-
-bool is_file_exist(const char *fileName)
-{
-    std::ifstream infile(fileName);
-    return infile.good();
-}
-
-void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & params,
-                         const server_params& sparams) {
+void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & params, const server_params& sparams) {
     fprintf(stderr, "\n");
     fprintf(stderr, "usage: %s [options] \n", argv[0]);
     fprintf(stderr, "\n");
@@ -139,6 +105,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -sow,      --split-on-word     [%-7s] split on word rather than on token\n",             params.split_on_word ? "true" : "false");
     fprintf(stderr, "  -bo N,     --best-of N         [%-7d] number of best candidates to keep\n",              params.best_of);
     fprintf(stderr, "  -bs N,     --beam-size N       [%-7d] beam size for beam search\n",                      params.beam_size);
+    fprintf(stderr, "  -ac N,     --audio-ctx N       [%-7d] audio context size (0 - all)\n",                   params.audio_ctx);
     fprintf(stderr, "  -wt N,     --word-thold N      [%-7.2f] word timestamp probability threshold\n",         params.word_thold);
     fprintf(stderr, "  -et N,     --entropy-thold N   [%-7.2f] entropy threshold for decoder fail\n",           params.entropy_thold);
     fprintf(stderr, "  -lpt N,    --logprob-thold N   [%-7.2f] log probability threshold for decoder fail\n",   params.logprob_thold);
@@ -184,6 +151,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params, serve
         else if (arg == "-ml"   || arg == "--max-len")         { params.max_len         = std::stoi(argv[++i]); }
         else if (arg == "-bo"   || arg == "--best-of")         { params.best_of         = std::stoi(argv[++i]); }
         else if (arg == "-bs"   || arg == "--beam-size")       { params.beam_size       = std::stoi(argv[++i]); }
+        else if (arg == "-ac"   || arg == "--audio-ctx")       { params.audio_ctx       = std::stoi(argv[++i]); }
         else if (arg == "-wt"   || arg == "--word-thold")      { params.word_thold      = std::stof(argv[++i]); }
         else if (arg == "-et"   || arg == "--entropy-thold")   { params.entropy_thold   = std::stof(argv[++i]); }
         else if (arg == "-lpt"  || arg == "--logprob-thold")   { params.logprob_thold   = std::stof(argv[++i]); }
@@ -272,8 +240,8 @@ std::string estimate_diarization_speaker(std::vector<std::vector<float>> pcmf32s
     std::string speaker = "";
     const int64_t n_samples = pcmf32s[0].size();
 
-    const int64_t is0 = timestamp_to_sample(t0, n_samples);
-    const int64_t is1 = timestamp_to_sample(t1, n_samples);
+    const int64_t is0 = timestamp_to_sample(t0, n_samples, WHISPER_SAMPLE_RATE);
+    const int64_t is1 = timestamp_to_sample(t1, n_samples, WHISPER_SAMPLE_RATE);
 
     double energy0 = 0.0f;
     double energy1 = 0.0f;
@@ -434,6 +402,10 @@ void get_req_parameters(const Request & req, whisper_params & params)
     {
         params.beam_size = std::stoi(req.get_file_value("beam_size").content);
     }
+    if (req.has_file("audio_ctx"))
+    {
+        params.audio_ctx = std::stof(req.get_file_value("audio_ctx").content);
+    }
     if (req.has_file("word_thold"))
     {
         params.word_thold = std::stof(req.get_file_value("word_thold").content);
@@ -525,7 +497,7 @@ int main(int argc, char ** argv) {
         check_ffmpeg_availibility();
     }
     // whisper init
-    struct whisper_context_params cparams;
+    struct whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = params.use_gpu;
 
     struct whisper_context * ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
@@ -541,9 +513,78 @@ int main(int argc, char ** argv) {
     Server svr;
     svr.set_default_headers({{"Server", "whisper.cpp"},
                              {"Access-Control-Allow-Origin", "*"},
-                             {"Access-Control-Allow-Headers", "content-type"}});
+                             {"Access-Control-Allow-Headers", "content-type, authorization"}});
 
-    std::string const default_content = "<html>hello</html>";
+    std::string const default_content = R"(
+    <html>
+    <head>
+        <title>Whisper.cpp Server</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width">
+        <style>
+        body {
+            font-family: sans-serif;
+        }
+        form {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+        }
+        label {
+            margin-bottom: 0.5rem;
+        }
+        input, select {
+            margin-bottom: 1rem;
+        }
+        button {
+            margin-top: 1rem;
+        }
+        </style>
+    </head>
+    <body>
+        <h1>Whisper.cpp Server</h1>
+
+        <h2>/inference</h2>
+        <pre>
+    curl 127.0.0.1:)" + std::to_string(sparams.port) + R"(/inference \
+    -H "Content-Type: multipart/form-data" \
+    -F file="@&lt;file-path&gt;" \
+    -F temperature="0.0" \
+    -F temperature_inc="0.2" \
+    -F response_format="json"
+        </pre>
+
+        <h2>/load</h2>
+        <pre>
+    curl 127.0.0.1:)" + std::to_string(sparams.port) + R"(/load \
+    -H "Content-Type: multipart/form-data" \
+    -F model="&lt;path-to-model-file&gt;"
+        </pre>
+
+        <div>
+            <h2>Try it out</h2>
+            <form action="/inference" method="POST" enctype="multipart/form-data">
+                <label for="file">Choose an audio file:</label>
+                <input type="file" id="file" name="file" accept="audio/*" required><br>
+
+                <label for="temperature">Temperature:</label>
+                <input type="number" id="temperature" name="temperature" value="0.0" step="0.01" placeholder="e.g., 0.0"><br>
+
+                <label for="response_format">Response Format:</label>
+                <select id="response_format" name="response_format">
+                    <option value="verbose_json">Verbose JSON</option>
+                    <option value="json">JSON</option>
+                    <option value="text">Text</option>
+                    <option value="srt">SRT</option>
+                    <option value="vtt">VTT</option>
+                </select><br>
+
+                <button type="submit">Submit</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    )";
 
     // store default params so we can reset after each inference request
     whisper_params default_params = params;
@@ -552,6 +593,9 @@ int main(int argc, char ** argv) {
     svr.Get(sparams.request_path + "/", [&default_content](const Request &, Response &res){
         res.set_content(default_content, "text/html");
         return false;
+    });
+
+    svr.Options(sparams.request_path + "/inference", [&](const Request &, Response &){
     });
 
     svr.Post(sparams.request_path + "/inference", [&](const Request &req, Response &res){
@@ -670,6 +714,7 @@ int main(int argc, char ** argv) {
             wparams.thold_pt         = params.word_thold;
             wparams.max_len          = params.max_len == 0 ? 60 : params.max_len;
             wparams.split_on_word    = params.split_on_word;
+            wparams.audio_ctx        = params.audio_ctx;
 
             wparams.speed_up         = params.speed_up;
             wparams.debug_mode       = params.debug_mode;
@@ -787,7 +832,13 @@ int main(int argc, char ** argv) {
         } else if (params.response_format == vjson_format) {
             /* try to match openai/whisper's Python format */
             std::string results = output_str(ctx, params, pcmf32s);
-            json jres = json{{"text", results}};
+            json jres = json{
+                {"task", params.translate ? "translate" : "transcribe"},
+                {"language", whisper_lang_str_full(whisper_full_lang_id(ctx))},
+                {"duration", float(pcmf32.size())/WHISPER_SAMPLE_RATE},
+                {"text", results},
+                {"segments", json::array()}
+            };
             const int n_segments = whisper_full_n_segments(ctx);
             for (int i = 0; i < n_segments; ++i)
             {
@@ -801,6 +852,7 @@ int main(int argc, char ** argv) {
                     segment["end"] = whisper_full_get_segment_t1(ctx, i) * 0.01;
                 }
 
+                float total_logprob = 0;
                 const int n_tokens = whisper_full_n_tokens(ctx, i);
                 for (int j = 0; j < n_tokens; ++j) {
                     whisper_token_data token = whisper_full_get_token_data(ctx, i, j);
@@ -815,8 +867,17 @@ int main(int argc, char ** argv) {
                         word["end"] = token.t1 * 0.01;
                     }
                     word["probability"] = token.p;
+                    total_logprob += token.plog;
                     segment["words"].push_back(word);
                 }
+
+                segment["temperature"] = params.temperature;
+                segment["avg_logprob"] = total_logprob / n_tokens;
+
+                // TODO compression_ratio and no_speech_prob are not implemented yet
+                // segment["compression_ratio"] = 0;
+                // segment["no_speech_prob"] = 0;
+
                 jres["segments"].push_back(segment);
             }
             res.set_content(jres.dump(-1, ' ', false, json::error_handler_t::replace),
